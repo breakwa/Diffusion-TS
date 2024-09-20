@@ -32,7 +32,7 @@ def parse_args():
                         ' used, and ddp will be disabled')
     
     # args for training
-    parser.add_argument('--train', action='store_true', default=False, help='Train or Test.')
+    parser.add_argument('--train', default=False, help='Train or Test.')
     parser.add_argument('--sample', type=int, default=0, 
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='infill',
@@ -57,10 +57,10 @@ def main():
     if args.seed is not None:
         seed_everything(args.seed)
 
-    if args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
+
+    torch.cuda.set_device(0) #args.gpu
     
-    config = load_yaml_config(args.config_file)
+    config = load_yaml_config('./Config/etth.yaml') #args.config_file
     config = merge_opts_to_config(config, args.opts)
 
     logger = Logger(args)
