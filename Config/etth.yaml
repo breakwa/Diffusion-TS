@@ -2,7 +2,7 @@ model:
   target: Models.interpretable_diffusion.gaussian_diffusion.Diffusion_TS
   params:
     seq_length: 24
-    feature_size: 7
+    feature_size: 1
     n_layer_enc: 3
     n_layer_dec: 2
     d_model: 64  # 4 X 16
@@ -45,7 +45,7 @@ dataloader:
     params:
       name: etth
       proportion: 1.0  # Set to rate < 1 if training conditional generation
-      data_root: ./Data/datasets/ETTh.csv
+      data_root: ./Data/datasets/ETTh-1var.csv
       window: 24  # seq_length
       save2npy: True
       neg_one_to_one: True
@@ -57,7 +57,7 @@ dataloader:
     params:
       name: etth
       proportion: 0.9  # rate
-      data_root: ./Data/datasets/ETTh.csv
+      data_root: ./Data/datasets/ETTh-1var.csv
       window: 24  # seq_length
       save2npy: True
       neg_one_to_one: True
