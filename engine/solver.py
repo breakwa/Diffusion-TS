@@ -85,8 +85,11 @@ class Trainer(object):
             while step < self.train_num_steps:
                 total_loss = 0.
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl)[2].to(device)
-                    loss = self.model(data, target=data)
+                    # text = next(self.dl)[0].to(device)
+                    # text_num = next(self.dl)[1].to(device)
+                    # data = next(self.dl)[2].to(device)
+                    text, text_num, data = [x.to(device) for x in next(self.dl)]
+                    loss = self.model(data, text, text_num, target=data)
                     loss = loss / self.gradient_accumulate_every
                     loss.backward()
                     total_loss += loss.item()
@@ -123,15 +126,22 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
-    def sample(self, num, size_every, shape=None):
+    def sample(self, dataloader, num, size_every, shape=None):
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to sample...')
         samples = np.empty([0, shape[0], shape[1]])
         num_cycle = int(num // size_every) + 1
+        data_iter = iter(dataloader)
 
         for _ in range(num_cycle):
-            sample = self.ema.ema_model.generate_mts(batch_size=size_every)
+            try:
+                text, text_num, data = next(data_iter)
+                text = text.to(self.device)
+                text_num = text_num.to(self.device)
+            except StopIteration:
+                break
+            sample = self.ema.ema_model.generate_mts(text, text_num, batch_size=size_every)
             samples = np.row_stack([samples, sample.detach().cpu().numpy()])
             torch.cuda.empty_cache()
 

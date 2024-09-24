@@ -144,44 +144,44 @@ class Diffusion_TS(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def output(self, x, t, padding_masks=None):
-        trend, season = self.model(x, t, padding_masks=padding_masks)
+    def output(self, text_input, text_num, x, t, padding_masks=None):
+        trend, season = self.model(text_input, text_num, x, t, padding_masks=padding_masks)
         model_output = trend + season
         return model_output
 
-    def model_predictions(self, x, t, clip_x_start=False, padding_masks=None):
+    def model_predictions(self, text, text_num, x, t, clip_x_start=False, padding_masks=None):
         if padding_masks is None:
             padding_masks = torch.ones(x.shape[0], self.seq_length, dtype=bool, device=x.device)
 
         maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
-        x_start = self.output(x, t, padding_masks)
+        x_start = self.output(text, text_num, x, t, padding_masks)
         x_start = maybe_clip(x_start)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
 
-    def p_mean_variance(self, x, t, clip_denoised=True):
-        _, x_start = self.model_predictions(x, t)
+    def p_mean_variance(self, text, text_num, x, t, clip_denoised=True):
+        _, x_start = self.model_predictions(text, text_num, x, t)
         if clip_denoised:
             x_start.clamp_(-1., 1.)
         model_mean, posterior_variance, posterior_log_variance = \
             self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
-    def p_sample(self, x, t: int, clip_denoised=True):
+    def p_sample(self, text, text_num, x, t: int, clip_denoised=True):
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = \
-            self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised)
+            self.p_mean_variance(text, text_num, x=x, t=batched_times, clip_denoised=clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
-    def sample(self, shape):
+    def sample(self, text, text_num, shape):
         device = self.betas.device
         img = torch.randn(shape, device=device)
         for t in tqdm(reversed(range(0, self.num_timesteps)),
                       desc='sampling loop time step', total=self.num_timesteps):
-            img, _ = self.p_sample(img, t)
+            img, _ = self.p_sample(text, text_num, img, t)
         return img
 
     @torch.no_grad()
@@ -215,10 +215,10 @@ class Diffusion_TS(nn.Module):
 
         return img
 
-    def generate_mts(self, batch_size=16):
+    def generate_mts(self, text, text_num, batch_size=16):
         feature_size, seq_length = self.feature_size, self.seq_length
         sample_fn = self.fast_sample if self.fast_sampling else self.sample
-        return sample_fn((batch_size, seq_length, feature_size))
+        return sample_fn(text, text_num, (batch_size, seq_length, feature_size))
 
     @property
     def loss_fn(self):
@@ -236,13 +236,13 @@ class Diffusion_TS(nn.Module):
                 extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
+    def _train_loss(self, text_input, text_num, x_start, t, target=None, noise=None, padding_masks=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         if target is None:
             target = x_start
 
         x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
-        model_out = self.output(x, t, padding_masks)
+        model_out = self.output(text_input, text_num, x, t, padding_masks)
 
         train_loss = self.loss_fn(model_out, target, reduction='none')
 
@@ -259,11 +259,11 @@ class Diffusion_TS(nn.Module):
         train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
         return train_loss.mean()
 
-    def forward(self, x, **kwargs):
+    def forward(self, x,text_input, text_num, **kwargs):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
         assert n == feature_size, f'number of variable must be {feature_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self._train_loss(x_start=x, t=t, **kwargs)
+        return self._train_loss(text_input, text_num, x_start=x, t=t, **kwargs)
 
     def return_components(self, x, t: int):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size

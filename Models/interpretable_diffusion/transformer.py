@@ -4,10 +4,12 @@ import numpy as np
 import torch.nn.functional as F
 
 from torch import nn
+from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP, \
+    AdaLayerNorm, GELU2, text_Conv_MLP
 from einops import rearrange, reduce, repeat
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
                                                        AdaLayerNorm, Transpose, GELU2, series_decomp
-
+from transformers import RobertaModel
 
 class TrendBlock(nn.Module):
     """
@@ -199,7 +201,51 @@ class CrossAttention(nn.Module):
         # output projection
         y = self.resid_drop(self.proj(y))
         return y, att
-    
+
+
+class TextToSeriesCrossAttention(nn.Module):
+    def __init__(self,
+                 n_embd,  # the embed dim
+                 condition_embd,  # condition dim768
+                 n_head,  # the number of heads
+                 attn_pdrop=0.1,  # attention dropout prob
+                 resid_pdrop=0.1,  # residual attention dropout prob
+                 ):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads
+        self.key = nn.Linear(condition_embd, n_embd)
+        self.query = nn.Linear(1, n_embd)
+        self.value = nn.Linear(condition_embd, n_embd)
+
+        # regularization
+        self.attn_drop = nn.Dropout(attn_pdrop)
+        self.resid_drop = nn.Dropout(resid_pdrop)
+        # output projection
+        self.proj = nn.Linear(n_embd, 1)
+        self.n_head = n_head
+
+    def forward(self, x, encoder_output, mask=None):
+        B, T, _ = x.size()
+        B, T_E, C_E = encoder_output.size()
+        C = self.query.out_features
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        k = self.key(encoder_output).view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = self.value(encoder_output).view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, T_E)
+
+        att = F.softmax(att, dim=-1)  # (B, nh, T, T_E)
+        att = self.attn_drop(att)
+        y = att @ v  # (B, nh, T, T_E) x (B, nh, T_E, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side, (B, T, C)
+        att = att.mean(dim=1, keepdim=False)  # (B, T, T_E)
+
+        # output projection
+        y = self.resid_drop(self.proj(y))
+        return y, att
+
 
 class EncoderBlock(nn.Module):
     """ an unassuming Transformer block """
@@ -299,7 +345,13 @@ class DecoderBlock(nn.Module):
                 attn_pdrop=attn_pdrop,
                 resid_pdrop=resid_pdrop,
                 )
-        
+        self.attent2s = TextToSeriesCrossAttention(
+            n_embd=n_embd,
+            condition_embd=768,
+            n_head=n_head,
+            attn_pdrop=attn_pdrop,
+            resid_pdrop=resid_pdrop,
+        )
         self.ln1_1 = AdaLayerNorm(n_embd)
 
         assert activate in ['GELU', 'GELU2']
@@ -320,13 +372,15 @@ class DecoderBlock(nn.Module):
         self.proj = nn.Conv1d(n_channel, n_channel * 2, 1)
         self.linear = nn.Linear(n_embd, n_feat)
 
-    def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
+    def forward(self, text_input_emb, x, encoder_output, timestep, mask=None, label_emb=None):
         a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
         x = x + a
         a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
         x = x + a
         x1, x2 = self.proj(x).chunk(2, dim=1)
         trend, season = self.trend(x1), self.seasonal(x2)
+        a, _ = self.attent2s(trend, text_input_emb, mask=mask)
+        trend = trend + a
         x = x + self.mlp(self.ln2(x))
         m = torch.mean(x, dim=1, keepdim=True)
         return x - m, self.linear(m), trend, season
@@ -361,7 +415,7 @@ class Decoder(nn.Module):
                 condition_dim=condition_dim,
         ) for _ in range(n_layer)])
       
-    def forward(self, x, t, enc, padding_masks=None, label_emb=None):
+    def forward(self, text_input_emb, x, t, enc, padding_masks=None, label_emb=None):
         b, c, _ = x.shape
         # att_weights = []
         mean = []
@@ -369,7 +423,7 @@ class Decoder(nn.Module):
         trend = torch.zeros((b, c, self.n_feat), device=x.device)
         for block_idx in range(len(self.blocks)):
             x, residual_mean, residual_trend, residual_season = \
-                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
+                self.blocks[block_idx](text_input_emb, x, enc, t, mask=padding_masks, label_emb=label_emb)
             season += residual_season
             trend += residual_trend
             mean.append(residual_mean)
@@ -398,7 +452,11 @@ class Transformer(nn.Module):
         super().__init__()
         self.emb = Conv_MLP(n_feat, n_embd, resid_pdrop=resid_pdrop)
         self.inverse = Conv_MLP(n_embd, n_feat, resid_pdrop=resid_pdrop)
-
+        self.text_emb = text_Conv_MLP(in_dim=1, out_dim=768, resid_pdrop=resid_pdrop)
+        self.text_num_dim_proj = nn.Conv1d(64, 768, kernel_size=1)
+        self.roberta = RobertaModel.from_pretrained(r"././robertadistillbase")
+        for param in self.roberta.parameters():
+            param.requires_grad = False
         if conv_params is None or conv_params[0] is None:
             if n_feat < 32 and n_channel < 64:
                 kernel_size, padding = 1, 0
@@ -419,13 +477,25 @@ class Transformer(nn.Module):
                                block_activate, condition_dim=n_embd)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
-    def forward(self, input, t, padding_masks=None, return_res=False):
+    def forward(self, text_input, text_num, input, t, padding_masks=None, return_res=False):
         emb = self.emb(input)
         inp_enc = self.pos_enc(emb)
         enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
 
         inp_dec = self.pos_dec(emb)
-        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
+
+        batch, seq = text_input.shape
+        text_input = text_input.unsqueeze(-1)
+        text_input = text_input.float().to(emb.device)
+        text_input_emb = self.text_emb(text_input)
+        text_num = text_num.float().to(emb.device)
+        text_num = self.emb(text_num)
+        text_num_expand = self.text_num_dim_proj(text_num.permute(0, 2, 1)).permute(0, 2, 1)
+        text_input_emb = text_input_emb + text_num_expand
+        outputs = self.roberta.encoder(text_input_emb.to(emb.device))
+        text_encoder_out = outputs.last_hidden_state
+
+        output, mean, trend, season = self.decoder(text_encoder_out, inp_dec, t, enc_cond, padding_masks=padding_masks)
 
         res = self.inverse(output)
         res_m = torch.mean(res, dim=1, keepdim=True)

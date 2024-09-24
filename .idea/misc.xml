@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="pytorch_clone" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="tf2x" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="pytorch_clone" project-jdk-type="Python SDK" />
 </project>
